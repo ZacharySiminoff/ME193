@@ -1,52 +1,48 @@
-'''
-Easiest way to use:
+"""
+Small wrapper around paho-mqtt for publishing and subscribing to an MQTT
+broker (defaults to the public test.mosquitto.org broker).
+"""
 
-from mqttlib import MQTTClient
-
-with MQTTClient() as client:
-    client.subscribe("ME193", lambda topic, payload: print(topic, payload))
-    client.publish("ME193", "hello world")
-'''
-
+import threading
 
 import paho.mqtt.client as mqtt
 
-BROKER = "test.mosquitto.org"
-PORT = 1883
-
 
 class MQTTClient:
-    def __init__(self, broker=BROKER, port=PORT):
+    def __init__(self, broker="test.mosquitto.org", port=1883, client_id=""):
         self.broker = broker
         self.port = port
-        self.callbacks = {}
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-        self.client.on_message = self._on_message
+        self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+        self._client.on_connect = self._on_connect
+        self._client.on_message = self._on_message
+        self._callbacks = {}  # topic -> callback(topic, payload)
+        self._connected = threading.Event()
 
-    def connect(self):
-        self.client.connect(self.broker, self.port, keepalive=60)
-        self.client.loop_start()
+    def connect(self, timeout=5):
+        self._client.connect(self.broker, self.port)
+        self._client.loop_start()  # handle network traffic on a background thread
+        self._connected.wait(timeout)  # block until the broker confirms the connection
 
     def disconnect(self):
-        self.client.loop_stop()
-        self.client.disconnect()
+        self._client.loop_stop()
+        self._client.disconnect()
+        self._connected.clear()
 
-    def _on_message(self, client, userdata, message):
-        payload = message.payload.decode()
-        for pattern, callback in self.callbacks.items():
-            if mqtt.topic_matches_sub(pattern, message.topic):
-                callback(message.topic, payload)
+    def publish(self, topic, message, qos=0, retain=False):
+        self._client.publish(topic, message, qos=qos, retain=retain)
 
-    def subscribe(self, topic, callback):
-        self.callbacks[topic] = callback
-        self.client.subscribe(topic)
+    def subscribe(self, topic, callback, qos=0):
+        """Call `callback(topic, payload)` whenever a message arrives on `topic`."""
+        self._callbacks[topic] = callback
+        self._client.subscribe(topic, qos=qos)
 
-    def unsubscribe(self, topic):
-        self.callbacks.pop(topic, None)
-        self.client.unsubscribe(topic)
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        self._connected.set()
 
-    def publish(self, topic, payload):
-        self.client.publish(topic, payload)
+    def _on_message(self, client, userdata, msg):
+        callback = self._callbacks.get(msg.topic)
+        if callback:
+            callback(msg.topic, msg.payload.decode())
 
     def __enter__(self):
         self.connect()
@@ -54,4 +50,3 @@ class MQTTClient:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.disconnect()
-        return False
