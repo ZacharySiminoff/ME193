@@ -1,0 +1,4 @@
+pyaudio>=0.2.14   # main.py — microphone input stream
+numpy>=1.24       # main.py — FFT / frequency analysis
+matplotlib>=3.7   # main.py — real-time spectrogram display
+paho-mqtt>=2.0    # mqttlib.py — MQTT publish/subscribe
