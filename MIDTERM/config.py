@@ -33,17 +33,16 @@ FAKE_SWING_POWER = 1.0
 FAKE_SWING_KEYS = {ord('1'): 0.25, ord('2'): 1.0, ord('3'): 2.5}
 
 # --- Camera / pose ---
-CAMERA_INDEX = 1           # run list_cameras.py to find yours
-# Which hand holds the motor: 'right' or 'left'. The player's paddle goes on
-# the same side of the screen (the camera view is mirrored, so your right hand
-# is on the right). Switch in game with the HAND button or the 'l' key.
+CAMERA_INDEX = 0           # 0 = built-in FaceTime camera; run list_cameras.py to find others
+# Which hand holds the motor: 'right' or 'left'. Switch in game with the
+# HAND button or the 'l' key.
 HAND = 'right'
 ARM_POINT = 'index'        # 'index' (end of the hand) or 'wrist'
 MIN_VISIBILITY = 0.5       # landmarks less visible than this are ignored
 POSE_MODEL_COMPLEXITY = 1  # 1 ships with mediapipe; 0 (faster) and 2 download a model on first use
 PADDLE_SMOOTHING = 0.5     # 0-1, higher = more responsive / jittery
 # Part of the camera image (normalized x0, y0, x1, y1) that maps onto the
-# paddle zone. Shrink it if you can't reach the edges of the zone.
+# paddle zone (PADDLE_ZONE below). Shrink it if you can't reach the edges.
 CAMERA_PADDLE_REGION = (0.1, 0.1, 0.9, 0.95)
 
 # --- AprilTag cursor ---
@@ -52,45 +51,57 @@ CAMERA_TAG_REGION = (0.15, 0.15, 0.85, 0.85)  # camera area that maps to the ful
 DWELL_SEC = 1.0            # hold the cursor on a button this long to click
 CLICK_COOLDOWN_SEC = 1.5
 
-# --- Window / layout (pixels) ---
+# --- Window / 3D view ---
 WIDTH, HEIGHT = 1280, 720
 TOP_BAR_H = 90
-PREVIEW_W, PREVIEW_H = 256, 144   # bottom corner on the CPU side, below the table
-TABLE_LEFT, TABLE_RIGHT = 240, 1040
-TABLE_Y = 520              # top surface of the table
-NET_X = (TABLE_LEFT + TABLE_RIGHT) // 2
-NET_H = 45
-FLOOR_Y = HEIGHT
-# Where the player's paddle can be (x0, y0, x1, y1)
-PADDLE_ZONE = (40, 230, 360, 680)
-PLAYER_HIT_X = 360         # ball must be left of this to be hittable
-CPU_HIT_X = TABLE_RIGHT + 40
+PREVIEW_W, PREVIEW_H = 256, 144   # camera preview, bottom-right corner
+# The 3D view's camera: where it sits, what it looks at, and its zoom
+VIEW_EYE = (0.0, 1.9, -3.9)        # meters, behind and above the player
+VIEW_TARGET = (0.0, 0.6, 0.8)
+VIEW_FOCAL = 960                   # pixels; bigger = more zoomed in
+VIEW_CENTER = (WIDTH // 2, 400)    # screen point the camera looks at
+
+# --- World (meters, real table tennis sizes) ---
+# x = left/right, y = up, z = along the table (you at -z, CPU at +z)
+TABLE_HALF_W = 0.7625              # table is 1.525 m wide
+TABLE_HALF_L = 1.37                # and 2.74 m long
+TABLE_H = 0.76                     # height of the playing surface
+NET_H = 0.1525
+NET_OVERHANG = 0.15                # net sticks out this far past each side
+BALL_RADIUS = 0.04                 # 2x a real ball, so it's easy to see
+PLAYER_Z = -1.75                   # your paddle moves in this plane
+PLAYER_HIT_Z = -1.1                # ball must be closer to you than this to hit it
+PLAYER_REACH_Z = -2.5              # past this the ball is behind you
+CPU_Z = 1.75                       # CPU paddle plane
+CPU_HIT_Z = 1.6                    # CPU returns the ball when it gets here
+# Where your paddle can be (x_min, y_min, x_max, y_max) in meters
+PADDLE_ZONE = (-1.1, 0.55, 1.1, 1.55)
+PADDLE_RADIUS = 0.11
 
 # --- Physics ---
-GRAVITY = 1400.0           # px/s^2
+GRAVITY = 5.0              # m/s^2 (about half of real, so the ball floats a bit)
 RESTITUTION = 0.85         # bounce height kept after hitting the table
-BALL_RADIUS = 10
 SERVE_DELAY_SEC = 1.5      # pause before each serve
-NET_CLEARANCE = 20         # shots are aimed to pass at least this far over the net
+NET_CLEARANCE = 0.06       # shots are aimed to pass at least this far over the net
+AIM_STRENGTH = 0.65        # how far sideways you can aim by hitting off-center (m)
 
 # --- Difficulty presets ---
-# hit_radius:   how close (px) the paddle must be to the ball for a swing to hit
+# hit_radius:   how close (m, left/right + up/down) the paddle must be to the ball
 # cpu_flight:   seconds for the CPU's shot to reach your side (lower = faster)
 # player_flight_slow/fast: your shot's flight time at min/max power
 # min_power:    weaker swings than this hit the net
 # max_power:    stronger swings than this fly off the end of the table
 DIFFICULTIES = {
-    'EASY':   dict(hit_radius=140, cpu_flight=1.35, player_flight_slow=1.3,
+    'EASY':   dict(hit_radius=0.32, cpu_flight=1.35, player_flight_slow=1.3,
                    player_flight_fast=0.8, min_power=0.30, max_power=2.2),
-    'MEDIUM': dict(hit_radius=100, cpu_flight=1.05, player_flight_slow=1.1,
+    'MEDIUM': dict(hit_radius=0.23, cpu_flight=1.05, player_flight_slow=1.1,
                    player_flight_fast=0.65, min_power=0.45, max_power=1.7),
-    'HARD':   dict(hit_radius=70,  cpu_flight=0.80, player_flight_slow=0.9,
+    'HARD':   dict(hit_radius=0.16, cpu_flight=0.80, player_flight_slow=0.9,
                    player_flight_fast=0.5, min_power=0.60, max_power=1.4),
 }
 DIFFICULTY_ORDER = ['EASY', 'MEDIUM', 'HARD']
 START_DIFFICULTY = 'MEDIUM'
 START_SERVER = 'PLAYER'    # 'PLAYER' or 'CPU'
-START_SIDE = HAND.upper()  # 'LEFT' or 'RIGHT'
 
 # --- MQTT / high score ---
 MQTT_BROKER = 'test.mosquitto.org'

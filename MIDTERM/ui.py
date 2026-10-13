@@ -2,12 +2,11 @@
 Everything drawn on screen (OpenCV), plus the on-screen buttons that the
 AprilTag cursor (or mouse) clicks by hovering.
 
-Renderer draws one frame per call:
-  cached arena background (per side) -> ball / paddles / effects -> glow
-  -> screen shake -> HUD (top bar, score, meter, camera preview, cursor)
-
-The game runs in "player on the left" coordinates; everything here converts
-x with mirror_x() so the player can be on either side of the screen.
+The 3D view is a simple pinhole camera (View) that projects world points
+(meters) to pixels, and things are drawn back-to-front:
+  cached arena (floor, wall, table) -> shadows -> CPU paddle -> net / ball
+  (whichever is farther first) -> sparks -> your paddle (see-through)
+  -> glow -> screen shake -> HUD (top bar, score, meter, camera preview, cursor)
 """
 
 import math
@@ -18,7 +17,7 @@ import cv2
 import numpy as np
 
 import config as C
-from game import WAITING, mirror_x
+from game import WAITING
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 FONT_BOLD = cv2.FONT_HERSHEY_DUPLEX
@@ -40,8 +39,7 @@ WOOD = (90, 150, 205)
 TABLE_TOP = (165, 85, 25)        # tournament blue
 TABLE_SIDE = (100, 48, 12)
 
-FLOOR_TOP = 600                  # where the back wall meets the floor
-BARRIER = (418, 482)             # y range of the advertising boards behind the table
+WALL_Z = 6.5                     # back wall
 GLOW_SCALE = 4                   # glow layer is drawn at 1/4 resolution, then blurred
 
 
@@ -99,8 +97,49 @@ def make_buttons(game):
         Button((16, 14, 246, 76), lambda: f'SERVE: {"YOU" if game.server == "PLAYER" else "CPU"}',
                game.toggle_server),
         Button((258, 14, 488, 76), lambda: f'LEVEL: {game.difficulty}', game.cycle_difficulty),
-        Button((500, 14, 730, 76), lambda: f'HAND: {game.side}', game.toggle_side),
+        Button((500, 14, 730, 76), lambda: f'HAND: {game.hand}', game.toggle_hand),
     ]
+
+
+# ---------------------------------------------------------------- 3D view
+
+class View:
+    """Pinhole camera: world (meters) -> screen (pixels)."""
+
+    def __init__(self, eye=C.VIEW_EYE, target=C.VIEW_TARGET, focal=C.VIEW_FOCAL, center=C.VIEW_CENTER):
+        self.eye = np.array(eye, np.float64)
+        f = np.array(target, np.float64) - self.eye
+        f /= np.linalg.norm(f)
+        r = np.cross([0.0, 1.0, 0.0], f)
+        r /= np.linalg.norm(r)
+        u = np.cross(f, r)
+        self.rot = np.stack([r, u, f])     # rows: camera right, up, forward
+        self.focal = focal
+        self.cx, self.cy = center
+
+    def project(self, pts):
+        """(N, 3) world points -> (N, 2) pixels and (N,) depths."""
+        c = (np.asarray(pts, np.float64) - self.eye) @ self.rot.T
+        z = np.maximum(c[:, 2], 0.05)
+        return np.stack([self.cx + self.focal * c[:, 0] / z, self.cy - self.focal * c[:, 1] / z], 1), z
+
+    def pt(self, x, y, z):
+        """One world point -> ((px, py) ints, depth)."""
+        p, d = self.project([(x, y, z)])
+        return (int(p[0, 0]), int(p[0, 1])), float(d[0])
+
+    def unproject(self, px, py, z_plane):
+        """Screen pixel -> world (x, y) on the plane z = z_plane (for the mouse)."""
+        d = self.rot.T @ np.array([(px - self.cx) / self.focal, -(py - self.cy) / self.focal, 1.0])
+        t = (z_plane - self.eye[2]) / d[2]
+        p = self.eye + t * d
+        return float(p[0]), float(p[1])
+
+    def size(self, meters, depth):
+        return self.focal * meters / depth
+
+    def poly(self, pts):
+        return self.project(pts)[0].astype(np.int32)
 
 
 # ---------------------------------------------------------------- drawing helpers
@@ -136,8 +175,20 @@ def rounded_rect(img, rect, r, color, thickness=-1):
             cv2.ellipse(img, (cx, cy), (r, r), 0, start, start + 90, color, thickness, AA)
 
 
-def blend(img, rect, draw_fn, alpha):
-    """Draw something semi-transparent inside rect (only that region is blended)."""
+def blend_poly(img, poly, color, alpha):
+    """Fill a polygon semi-transparently (only its bounding box is blended)."""
+    x0, y0 = np.maximum(poly.min(0) - 2, 0)
+    x1, y1 = np.minimum(poly.max(0) + 2, (img.shape[1], img.shape[0]))
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = img[y0:y1, x0:x1]
+    layer = roi.copy()
+    cv2.fillPoly(layer, [poly - np.array([x0, y0])], color, AA)
+    cv2.addWeighted(layer, alpha, roi, 1 - alpha, 0, roi)
+
+
+def blend_draw(img, rect, draw_fn, alpha):
+    """Run draw_fn(layer, offset) on a copy of rect and blend it back in."""
     x0, y0, x1, y1 = [int(v) for v in rect]
     x0, y0, x1, y1 = max(x0, 0), max(y0, 0), min(x1, img.shape[1]), min(y1, img.shape[0])
     if x1 <= x0 or y1 <= y0:
@@ -152,109 +203,121 @@ def scale_color(color, f):
     return tuple(int(c * f) for c in color)
 
 
-def dashed_circle(img, center, r, color, dashes=24, thick=1):
-    step = 360 / dashes
-    for i in range(dashes):
-        a = i * step
-        cv2.ellipse(img, center, (r, r), 0, a, a + step * 0.55, color, thick, AA)
+def circle_on_plane(cx, y, cz, r, n=20):
+    """Points of a flat horizontal circle (on the table or floor)."""
+    a = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    return np.stack([cx + r * np.cos(a), np.full(n, y), cz + r * np.sin(a)], 1)
+
+
+def circle_facing(cx, cy, cz, r, n=32):
+    """Points of an upright circle facing the camera (in a z = const plane)."""
+    a = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    return np.stack([cx + r * np.cos(a), cy + r * np.sin(a), np.full(n, cz)], 1)
 
 
 # ---------------------------------------------------------------- background
 
-def build_background(side):
-    """Static arena: lit back wall, boards, floor, table and net. Cached per side."""
+def build_background(view):
+    """Static arena: lit wall, boards, floor grid, table with legs and shadow."""
     ys = np.arange(H, dtype=np.float32)[:, None]
     xs = np.arange(W, dtype=np.float32)[None, :]
+    floor_y = view.pt(0, 0, WALL_Z)[0][1]          # where the floor meets the back wall
+
     img = np.zeros((H, W, 3), np.float32)
+    t = np.clip(ys / floor_y, 0, 1)[..., None]
+    img[:] = np.array([40, 14, 22]) * (1 - t) + np.array([78, 36, 40]) * t
+    ft = np.clip((ys - floor_y) / (H - floor_y), 0, 1)[..., None]
+    floor = np.array([52, 34, 36]) * (1 - ft) + np.array([24, 15, 17]) * ft
+    img = np.where(ys[..., None] >= floor_y, floor, img)
 
-    # Back wall gradient + floor gradient
-    wall_top, wall_bot = np.array([40, 14, 22]), np.array([78, 36, 40])
-    t = np.clip(ys / FLOOR_TOP, 0, 1)[..., None]
-    img[:] = wall_top * (1 - t) + wall_bot * t
-    ft = np.clip((ys - FLOOR_TOP) / (H - FLOOR_TOP), 0, 1)[..., None]
-    floor = np.array([48, 32, 34]) * (1 - ft) + np.array([22, 14, 16]) * ft
-    img = np.where(ys[..., None] >= FLOOR_TOP, floor, img)
-
-    # Spotlight over the table and its pool of light on the floor
-    d = ((xs - W / 2) / 650) ** 2 + ((ys - 180) / 520) ** 2
+    # Spotlight from above the table, and its pool of light on the floor
+    d = ((xs - W / 2) / 700) ** 2 + ((ys - 150) / 480) ** 2
     img += np.clip(1 - d, 0, 1)[..., None] ** 2 * np.array([70, 55, 50])
-    d = ((xs - W / 2) / 620) ** 2 + ((ys - 670) / 70) ** 2
-    img += np.clip(1 - d, 0, 1)[..., None] * np.array([40, 34, 34]) * (ys[..., None] >= FLOOR_TOP)
+    d = ((xs - W / 2) / 650) ** 2 + ((ys - (floor_y + 160)) / 170) ** 2
+    img += np.clip(1 - d, 0, 1)[..., None] * np.array([38, 32, 32]) * (ys[..., None] >= floor_y)
 
     # Soft bokeh lights high on the wall
     bokeh = np.zeros((H, W, 3), np.float32)
     rng = random.Random(7)
     for _ in range(45):
         c = rng.choice([(255, 180, 90), (255, 120, 200), (120, 200, 255), (200, 255, 255)])
-        cv2.circle(bokeh, (rng.randrange(W), rng.randrange(20, 380)), rng.randrange(3, 16),
+        cv2.circle(bokeh, (rng.randrange(W), rng.randrange(20, max(40, floor_y - 120))), rng.randrange(3, 14),
                    [v * rng.uniform(0.08, 0.25) for v in c], -1, AA)
     img += cv2.GaussianBlur(bokeh, (0, 0), 6)
-
     img = np.clip(img, 0, 255).astype(np.uint8)
 
-    # Perspective floor lines
-    vx, vy = W / 2, 330
-    for i in range(-12, 13):
-        bx = W / 2 + i * 140
-        fx = vx + (bx - vx) * (FLOOR_TOP - vy) / (H - vy)
-        cv2.line(img, (int(fx), FLOOR_TOP), (int(bx), H), (62, 44, 46), 1, AA)
-    for k in range(1, 7):
-        y = int(FLOOR_TOP + (H - FLOOR_TOP) * (k / 6) ** 1.8)
-        cv2.line(img, (0, y), (W, y), (58, 40, 42), 1, AA)
+    # Floor grid (1 m squares)
+    for gx in range(-8, 9):
+        a, b = view.poly([(gx, 0, -2.9), (gx, 0, WALL_Z)])
+        cv2.line(img, tuple(a), tuple(b), (66, 46, 48), 1, AA)
+    for gz in range(-2, int(WALL_Z) + 1):
+        a, b = view.poly([(-9, 0, gz), (9, 0, gz)])
+        cv2.line(img, tuple(a), tuple(b), (62, 44, 46), 1, AA)
 
-    # Advertising boards behind the table
-    by0, by1 = BARRIER
-    cv2.rectangle(img, (0, by0), (W, by1), (34, 22, 28), -1)
+    # Advertising boards along the back wall
+    board_h = 0.9
     panel_colors = [(120, 40, 20), (40, 30, 110), (90, 30, 90), (30, 90, 110)]
-    for i, x in enumerate(range(0, W, 160)):
-        cv2.rectangle(img, (x + 4, by0 + 6), (x + 156, by1 - 6), panel_colors[i % 4], -1)
-    cv2.line(img, (0, by0), (W, by0), (120, 100, 110), 2)
-    cv2.line(img, (0, by1), (W, by1), (20, 12, 16), 2)
+    words = ['ME193', 'TUFTS', 'AI ROBOTICS', 'LEGO', 'PING PONG', 'MEDIAPIPE', 'ME193', 'TUFTS']
+    cv2.fillPoly(img, [view.poly([(-9, 0, WALL_Z), (9, 0, WALL_Z), (9, board_h, WALL_Z), (-9, board_h, WALL_Z)])],
+                 (34, 22, 28), AA)
+    for i in range(8):
+        x0 = -8 + 2 * i
+        poly = view.poly([(x0 + 0.05, 0.08, WALL_Z), (x0 + 1.95, 0.08, WALL_Z),
+                          (x0 + 1.95, board_h - 0.08, WALL_Z), (x0 + 0.05, board_h - 0.08, WALL_Z)])
+        cv2.fillPoly(img, [poly], panel_colors[i % 4], AA)
+        (px, py), depth = view.pt(x0 + 1.0, board_h / 2 - 0.12, WALL_Z)
+        text(img, words[i], (px, py), view.size(0.0085, depth), (225, 225, 235), 2, font=FONT_BOLD, shadow=False)
+    a, b = view.poly([(-9, board_h, WALL_Z), (9, board_h, WALL_Z)])
+    cv2.line(img, tuple(a), tuple(b), (120, 100, 110), 2, AA)
+
+    hw, hl, th = C.TABLE_HALF_W, C.TABLE_HALF_L, C.TABLE_H
 
     # Table shadow on the floor
-    blend(img, (0, 640, W, H), lambda l, o: cv2.ellipse(
-        l, (W // 2 - o[0], 692 - o[1]), (470, 20), 0, 0, 360, (5, 5, 5), -1, AA), 0.6)
+    shadow = view.poly([(-hw - 0.1, 0, -hl - 0.1), (hw + 0.1, 0, -hl - 0.1), (hw + 0.1, 0, hl + 0.1),
+                        (-hw - 0.1, 0, hl + 0.1)])
+    mask = np.zeros((H, W), np.uint8)
+    cv2.fillPoly(mask, [shadow], 255, AA)
+    mask = cv2.GaussianBlur(mask, (0, 0), 12).astype(np.float32)[..., None] / 255
+    img = (img * (1 - 0.6 * mask)).astype(np.uint8)
 
-    # Legs (far pair darker, near pair lighter)
-    L, R, T = C.TABLE_LEFT, C.TABLE_RIGHT, C.TABLE_Y
-    for x, shade in ((L + 90, (45, 45, 50)), (R - 90, (45, 45, 50))):
-        cv2.line(img, (x, T + 16), (x + 8, 676), shade, 9, AA)
-    for x, shade in ((L + 55, (80, 80, 88)), (R - 55, (80, 80, 88))):
-        cv2.line(img, (x, T + 16), (x - 6, 694), shade, 11, AA)
-        cv2.line(img, (x - 3, T + 16), (x - 9, 694), (130, 130, 140), 2, AA)
+    # Legs (far ones first)
+    for lz in (hl - 0.25, -hl + 0.25):
+        for lx in (-hw + 0.12, hw - 0.12):
+            (ax, ay), d = view.pt(lx, th - 0.03, lz)
+            (bx, by), _ = view.pt(lx, 0, lz)
+            wid = max(2, int(view.size(0.05, d)))
+            cv2.line(img, (ax, ay), (bx, by), (70, 70, 78), wid, AA)
+            cv2.line(img, (ax - wid // 3, ay), (bx - wid // 3, by), (125, 125, 135), max(1, wid // 4), AA)
 
-    # Table: front apron + top face (slight perspective) + white lines
-    cv2.rectangle(img, (L, T), (R, T + 16), TABLE_SIDE, -1)
-    top = np.array([(L, T), (R, T), (R - 16, T - 12), (L + 16, T - 12)], np.int32)
+    # Table: front edge face, then the top, then white lines
+    front = view.poly([(-hw, th, -hl), (hw, th, -hl), (hw, th - 0.05, -hl), (-hw, th - 0.05, -hl)])
+    cv2.fillPoly(img, [front], TABLE_SIDE, AA)
+    top = view.poly([(-hw, th, -hl), (hw, th, -hl), (hw, th, hl), (-hw, th, hl)])
     cv2.fillPoly(img, [top], TABLE_TOP, AA)
-    cv2.polylines(img, [top], True, WHITE, 2, AA)
-    cv2.line(img, (L + 8, T - 6), (R - 8, T - 6), (235, 235, 235), 1, AA)   # center line
-    cv2.line(img, (L, T + 16), (R, T + 16), (60, 30, 8), 2)
-
-    # Net: skewed mesh panel, white tape on top, posts
-    nx, nh = C.NET_X, C.NET_H
-    net = np.array([(nx, T), (nx, T - nh), (nx + 7, T - nh - 12), (nx + 7, T - 12)], np.int32)
-    blend(img, (nx - 10, T - nh - 20, nx + 20, T + 5),
-          lambda l, o: cv2.fillPoly(l, [net - np.array(o, np.int32)], (30, 30, 30), AA), 0.55)
-    for yy in range(T - nh, T, 5):
-        cv2.line(img, (nx, yy), (nx + 7, yy - 12), (200, 200, 200), 1, AA)
-    for k in range(0, 8, 3):
-        cv2.line(img, (nx + k, T - k * 12 // 7), (nx + k, T - nh - k * 12 // 7), (200, 200, 200), 1, AA)
-    cv2.line(img, (nx, T - nh), (nx + 7, T - nh - 12), WHITE, 3, AA)
-    cv2.line(img, (nx, T + 2), (nx, T - nh - 2), (230, 230, 230), 3, AA)
+    cv2.polylines(img, [top], True, WHITE, 3, AA)
+    a, b = view.poly([(0, th, -hl), (0, th, hl)])
+    cv2.line(img, tuple(a), tuple(b), (235, 235, 235), 2, AA)    # center line
 
     # Vignette
     d = ((xs - W / 2) / (W * 0.75)) ** 2 + ((ys - H / 2) / (H * 0.8)) ** 2
-    img = (img * np.clip(1 - 0.6 * d, 0.3, 1)[..., None]).astype(np.uint8)
+    return (img * np.clip(1 - 0.6 * d, 0.3, 1)[..., None]).astype(np.uint8)
 
-    if side == 'RIGHT':
-        img = cv2.flip(img, 1)
 
-    # Board text after flipping so it's readable on both sides
-    for i, word in enumerate(['ME193', 'TUFTS', 'AI ROBOTICS', 'LEGO', 'PING PONG',
-                              'ME193', 'TUFTS', 'MEDIAPIPE']):
-        text(img, word, (i * 160 + 80, by0 + 42), 0.62, (225, 225, 235), 2, font=FONT_BOLD, shadow=False)
-    return img
+def draw_net(img, view):
+    hw, th, nh = C.TABLE_HALF_W + C.NET_OVERHANG, C.TABLE_H, C.NET_H
+    blend_poly(img, view.poly([(-hw, th, 0), (hw, th, 0), (hw, th + nh, 0), (-hw, th + nh, 0)]), (25, 25, 25), 0.5)
+    for k in range(1, 6):
+        y = th + nh * k / 6
+        a, b = view.poly([(-hw, y, 0), (hw, y, 0)])
+        cv2.line(img, tuple(a), tuple(b), (170, 170, 170), 1, AA)
+    for x in np.arange(-hw, hw + 1e-6, 0.08):
+        a, b = view.poly([(x, th, 0), (x, th + nh, 0)])
+        cv2.line(img, tuple(a), tuple(b), (150, 150, 150), 1, AA)
+    a, b = view.poly([(-hw, th + nh, 0), (hw, th + nh, 0)])
+    cv2.line(img, tuple(a), tuple(b), WHITE, 4, AA)                     # tape
+    for x in (-hw, hw):                                                  # posts
+        a, b = view.poly([(x, th - 0.02, 0), (x, th + nh + 0.01, 0)])
+        cv2.line(img, tuple(a), tuple(b), (60, 60, 60), 5, AA)
 
 
 def make_red_vignette():
@@ -274,64 +337,68 @@ def make_meter_gradient(h, w):
 # ---------------------------------------------------------------- renderer
 
 class Renderer:
-    def __init__(self):
-        self._bg = {}
+    def __init__(self, view=None):
+        self.view = view or View()
+        self._bg = build_background(self.view)
         self._red = make_red_vignette()
-        self._meter_h = C.TABLE_Y - (C.TOP_BAR_H + 120)
+        self._meter_top = C.TOP_BAR_H + 130
+        self._meter_h = 330
         self._meter = make_meter_gradient(self._meter_h, 16)
-        self.trail = deque(maxlen=16)
-        self.particles = []          # [x, y, vx, vy, life, max_life, color, size]
-        self.ripples = []            # [x, t0]
-        self.popups = []             # [text, x, y, t0, color, scale]
+        self.trail = deque(maxlen=14)    # recent ball positions (world)
+        self.particles = []              # [x, y, z, vx, vy, vz, life, max_life, color, size_m]
+        self.ripples = []                # [x, z, t0]
+        self.popups = []                 # [text, (x, y, z), t0, color, scale]
         self.shake = 0.0
         self.flash = 0.0
-        self.swing_t = -10.0         # player paddle swing animation start
+        self.swing_t = -10.0             # player paddle swing animation start
         self.swing_power = 1.0
         self.cpu_swing_t = -10.0
-        self.score_t = -10.0         # score pulse start
-        self.banner_t = -10.0        # NEW HIGH SCORE banner start
+        self.score_t = -10.0             # score pulse start
+        self.banner_t = -10.0            # NEW HIGH SCORE banner start
         self._high_announced = False
         self._last_t = None
         self._rng = random.Random()
 
     # ----- effects from game events
-    def _spark(self, x, y, n, colors, speed=420, size=(2, 5), up=True):
+    def _spark(self, pos, n, colors, speed=3.0, size=(0.008, 0.02)):
         for _ in range(n):
-            a = self._rng.uniform(0, 2 * math.pi)
+            # random direction on a sphere, biased upward
+            u, a = self._rng.uniform(-1, 1), self._rng.uniform(0, 2 * math.pi)
+            s = math.sqrt(1 - u * u)
             v = self._rng.uniform(0.3, 1.0) * speed
             life = self._rng.uniform(0.35, 0.8)
-            self.particles.append([x, y, math.cos(a) * v, math.sin(a) * v - (200 if up else 0),
+            self.particles.append([*pos, s * math.cos(a) * v, u * v + 1.2, s * math.sin(a) * v,
                                    life, life, self._rng.choice(colors), self._rng.uniform(*size)])
 
     def _handle_events(self, game, now):
-        S = lambda x: mirror_x(x, game.side)  # noqa: E731
         for kind, e in game.pop_events():
+            pos = (e.get('x', 0), e.get('y', 0), e.get('z', 0))
             if kind == 'swing':
                 self.swing_t, self.swing_power = now, e['power']
             elif kind == 'hit':
-                x, y, p = S(e['x']), e['y'], e['power']
+                p = e['power']
                 if e['quality'] == 'good':
-                    self._spark(x, y, int(14 + 18 * min(p, 2)), [ORANGE, GOLD, WHITE], 380 + 200 * p)
-                    self.popups.append(['+1', x, y - 30, now, GOOD, 1.4])
+                    self._spark(pos, int(16 + 18 * min(p, 2)), [ORANGE, GOLD, WHITE], 2.0 + 1.2 * p)
+                    self.popups.append(['+1', (pos[0], pos[1] + 0.15, pos[2]), now, GOOD, 1.5])
                     self.score_t = now
                 else:
-                    self._spark(x, y, 10, [GREY, BAD])
+                    self._spark(pos, 10, [GREY, BAD], 1.5)
                     self.popups.append(['TOO SOFT' if e['quality'] == 'soft' else 'TOO HARD',
-                                        x, y - 30, now, BAD, 0.9])
+                                        (pos[0], pos[1] + 0.15, pos[2]), now, BAD, 1.0])
                 self.shake = max(self.shake, 3 + 5 * min(p, 2))
             elif kind == 'whiff':
                 px, py = game.paddle
-                self.popups.append(['WHIFF', S(px), py - 50, now, GREY, 0.8])
+                self.popups.append(['WHIFF', (px, py + 0.2, C.PLAYER_Z), now, GREY, 0.9])
             elif kind == 'cpu_hit':
                 self.cpu_swing_t = now
-                self._spark(S(e['x']), e['y'], 10, [CYAN, WHITE], 280)
+                self._spark(pos, 12, [CYAN, WHITE], 1.6)
             elif kind == 'bounce':
-                self.ripples.append([S(e['x']), now])
-                self._spark(S(e['x']), C.TABLE_Y - 4, 5, [WHITE, CYAN], 160, (1, 3))
+                self.ripples.append([pos[0], pos[2], now])
+                self._spark((pos[0], C.TABLE_H + 0.01, pos[2]), 6, [WHITE, CYAN], 1.0, (0.005, 0.01))
             elif kind == 'lost':
                 self.flash = 1.0
                 self.shake = max(self.shake, 9)
-                self._spark(S(e['x']), min(e['y'], H - 10), 18, [BAD, (40, 40, 200)], 300)
+                self._spark((pos[0], max(pos[1], 0.05), pos[2]), 20, [BAD, (40, 40, 200)], 2.0)
                 self._high_announced = False
                 self.trail.clear()
             elif kind == 'new_high' and not self._high_announced and e['score'] > 1:
@@ -341,133 +408,151 @@ class Renderer:
                 self.trail.clear()
                 self._high_announced = False
 
-    # ----- paddle
-    def _draw_paddle(self, img, glow, gx, gy, lean, facing, rubber, side):
-        """Paddle at game coords (gx, gy). lean = degrees tilted toward the opponent."""
-        head = cv2.ellipse2Poly((0, 0), (17, 27), int(lean), 0, 360, 12).astype(np.float32)
-        a = math.radians(lean)
-        hd = (-math.sin(a), math.cos(a))   # handle direction (head's "down" axis)
-        handle = np.array([(hd[0] * 22, hd[1] * 22), (hd[0] * 50, hd[1] * 50)], np.float32)
-
-        def to_screen(pts):
-            pts = pts.copy()
-            pts[:, 0] = mirror_x(gx + facing * pts[:, 0], side)
-            pts[:, 1] += gy
-            return pts.astype(np.int32)
-
-        h = to_screen(handle)
-        cv2.line(img, tuple(h[0]), tuple(h[1]), (40, 70, 100), 12, AA)
-        cv2.line(img, tuple(h[0]), tuple(h[1]), WOOD, 8, AA)
-        poly = to_screen(head)
-        cv2.fillPoly(img, [poly], rubber, AA)
-        cv2.polylines(img, [poly], True, (225, 225, 225), 2, AA)   # sponge edge
-        hl = to_screen(head * 0.55 + np.array([-4 * facing, -6], np.float32))
-        cv2.polylines(img, [hl], True, scale_color(rubber, 1.4), 1, AA)
-        c = to_screen(np.zeros((1, 2), np.float32))[0]
-        cv2.circle(glow, (c[0] // GLOW_SCALE, c[1] // GLOW_SCALE), 9, scale_color(rubber, 0.5), -1)
-
+    # ----- paddles
     @staticmethod
     def _swing_lean(t_since, power):
         if t_since > 0.32:
             return 0.0
         return math.sin(math.pi * t_since / 0.32) * (35 + 30 * min(power, 2) / 2)
 
+    def _draw_paddle(self, img, glow, x, y, z, lean, rubber, alpha=1.0):
+        """Round paddle facing the camera at world (x, y, z), handle pointing down."""
+        v = self.view
+        (cx, cy), depth = v.pt(x, y, z)
+        r = v.size(C.PADDLE_RADIUS, depth)
+        a = math.radians(lean)
+        hd = (-math.sin(a), math.cos(a))       # handle direction on screen
+        h0 = (int(cx + hd[0] * r * 0.85), int(cy + hd[1] * r * 0.85))
+        h1 = (int(cx + hd[0] * r * 1.9), int(cy + hd[1] * r * 1.9))
+        head = cv2.ellipse2Poly((cx, cy), (max(2, int(r * 0.92)), max(2, int(r))), int(lean), 0, 360, 10)
+        hw = max(2, int(r * 0.32))
+
+        def draw(layer, o):
+            off = np.array(o)
+            cv2.line(layer, tuple(np.subtract(h0, o)), tuple(np.subtract(h1, o)), (40, 70, 100), hw + 4, AA)
+            cv2.line(layer, tuple(np.subtract(h0, o)), tuple(np.subtract(h1, o)), WOOD, hw, AA)
+            cv2.fillPoly(layer, [head - off], rubber, AA)
+            cv2.polylines(layer, [head - off], True, (225, 225, 225), max(1, int(r * 0.08)), AA)
+            hl = ((head - (cx, cy)) * 0.55 + (cx - r * 0.15, cy - r * 0.2)).astype(np.int32)
+            cv2.polylines(layer, [hl - off], True, scale_color(rubber, 1.4), 1, AA)
+
+        pad = int(r * 2.2) + 8
+        if alpha >= 1.0:
+            draw(img, (0, 0))
+        else:
+            blend_draw(img, (cx - pad, cy - pad, cx + pad, cy + pad), draw, alpha)
+        cv2.circle(glow, (cx // GLOW_SCALE, cy // GLOW_SCALE), max(1, int(r * 0.7) // GLOW_SCALE),
+                   scale_color(rubber, 0.5), -1)
+
+    def _surface_shadow(self, img, x, y, z, radius, strength=0.55):
+        """Dark blob under (x, y, z): on the table if above it, else on the floor."""
+        over = abs(x) <= C.TABLE_HALF_W and abs(z) <= C.TABLE_HALF_L and y >= C.TABLE_H
+        ground = C.TABLE_H + 0.002 if over else 0.0
+        hgt = max(0.0, y - ground)
+        poly = self.view.poly(circle_on_plane(x, ground, z, radius * (1 + hgt * 0.8), 16))
+        blend_poly(img, poly, (0, 0, 0), strength * max(0.2, 1 - hgt / 1.2))
+
     # ----- main draw
-    def draw(self, game, clicker, cursor=None, preview=None, meter=0.0, show_debug=True, info=''):
+    def draw(self, game, clicker, cursor=None, preview=None, meter=0.0, show_debug=True, info='', alert=''):
+        v = self.view
         now = game.time
         dt = 0.0 if self._last_t is None else max(0.0, min(now - self._last_t, 0.1))
         self._last_t = now
-        side = game.side
-        S = lambda x: int(mirror_x(x, side))  # noqa: E731
-
         self._handle_events(game, now)
-        if side not in self._bg:
-            self._bg[side] = build_background(side)
-        img = self._bg[side].copy()
+
+        img = self._bg.copy()
         glow = np.zeros((H // GLOW_SCALE, W // GLOW_SCALE, 3), np.uint8)
 
-        def g(x, y, r, color):
-            cv2.circle(glow, (int(x) // GLOW_SCALE, int(y) // GLOW_SCALE), max(1, int(r) // GLOW_SCALE),
+        def g(px, py, r, color):
+            cv2.circle(glow, (int(px) // GLOW_SCALE, int(py) // GLOW_SCALE), max(1, int(r) // GLOW_SCALE),
                        color, -1, AA)
-
-        # Bounce ripples on the table top
-        for rp in self.ripples:
-            age = now - rp[1]
-            r = int(10 + age * 120)
-            fade = max(0.0, 1 - age / 0.45)
-            cv2.ellipse(img, (int(rp[0]), C.TABLE_Y - 5), (r, max(2, r // 5)), 0, 0, 360,
-                        scale_color((255, 230, 200), fade), 2, AA)
-        self.ripples = [rp for rp in self.ripples if now - rp[1] < 0.45]
-
-        # Paddle zone
-        x0, y0, x1, y1 = C.PADDLE_ZONE
-        zx0, zx1 = sorted((S(x0), S(x1)))
-        rounded_rect(img, (zx0, y0, zx1, y1), 18, (90, 70, 80), 1)
-        text(img, 'YOUR ZONE', ((zx0 + zx1) // 2, y0 + 22), 0.5, (140, 120, 130), 1, shadow=False)
 
         b = game.ball
         R = C.BALL_RADIUS
-
-        # Ball shadow (on the table when above it, otherwise on the floor)
-        if b is not None:
-            bx = S(b.x)
-            if C.TABLE_LEFT <= b.x <= C.TABLE_RIGHT and b.y <= C.TABLE_Y + 1:
-                hgt = C.TABLE_Y - b.y
-                sy, sa = C.TABLE_Y - 5, 0.55 * max(0.25, 1 - hgt / 350)
-            else:
-                hgt = 690 - b.y
-                sy, sa = 690, 0.45 * max(0.2, 1 - hgt / 500)
-            sw = int(R + 4 + hgt * 0.03)
-            blend(img, (bx - sw - 2, sy - 6, bx + sw + 2, sy + 6), lambda l, o: cv2.ellipse(
-                l, (bx - o[0], sy - o[1]), (sw, 4), 0, 0, 360, (0, 0, 0), -1, AA), sa)
-
-        # CPU paddle follows the ball when it's coming its way
-        cpu_y = C.TABLE_Y - 70
-        if b is not None and game.last_hitter == 'PLAYER':
-            cpu_y = min(max(b.y, C.TABLE_Y - 260), C.TABLE_Y + 30)
-        self._draw_paddle(img, glow, C.CPU_HIT_X + 18, cpu_y, 10 + self._swing_lean(now - self.cpu_swing_t, 1.0),
-                          -1, CPU_RUBBER, side)
-
-        # Player paddle (+ dashed hit radius when debugging)
         px, py = game.paddle
-        if show_debug:
-            dashed_circle(img, (S(px), int(py)), game.settings['hit_radius'], (110, 90, 170))
-        self._draw_paddle(img, glow, px, py, 12 + self._swing_lean(now - self.swing_t, self.swing_power),
-                          1, PLAYER_RUBBER, side)
 
-        # Ball: trail, glow, body, highlight
+        # Bounce ripples on the table
+        for rp in self.ripples:
+            age = now - rp[2]
+            poly = v.poly(circle_on_plane(rp[0], C.TABLE_H + 0.003, rp[1], 0.04 + age * 0.5, 24))
+            cv2.polylines(img, [poly], True, scale_color((255, 230, 200), max(0.0, 1 - age / 0.45)), 2, AA)
+        self.ripples = [rp for rp in self.ripples if now - rp[2] < 0.45]
+
+        # Shadows: ball, both paddles
         if b is not None:
-            pos = (S(b.x), int(b.y - R))
-            self.trail.append(pos)
-            n = len(self.trail)
-            for i, (tx, ty) in enumerate(self.trail):
+            self._surface_shadow(img, b.x, b.y, b.z, R * 1.1)
+        self._surface_shadow(img, px, py, C.PLAYER_Z, C.PADDLE_RADIUS, 0.35)
+        cpu_y = C.TABLE_H + 0.3 if b is None else min(max(b.y, C.TABLE_H + 0.1), C.TABLE_H + 0.8)
+        self._surface_shadow(img, game.cpu_x, cpu_y, C.CPU_Z, C.PADDLE_RADIUS, 0.35)
+
+        # CPU paddle (farthest)
+        self._draw_paddle(img, glow, game.cpu_x, cpu_y, C.CPU_Z,
+                          -10 - self._swing_lean(now - self.cpu_swing_t, 1.0), CPU_RUBBER)
+
+        # Net and ball, farthest first
+        def draw_ball():
+            if b is None:
+                return
+            self.trail.append((b.x, b.y, b.z))
+            pts, depths = v.project(list(self.trail))
+            n = len(pts)
+            for i, ((tx, ty), d) in enumerate(zip(pts, depths)):
                 f = (i + 1) / n
-                cv2.circle(img, (tx, ty), max(1, int(R * f * 0.8)), scale_color(ORANGE, 0.25 + 0.5 * f), -1, AA)
-                g(tx, ty, R * 1.6 * f, scale_color(ORANGE, 0.5 * f))
-            g(pos[0], pos[1], R * 3, (20, 90, 200))
-            cv2.circle(img, pos, R, (20, 110, 230), -1, AA)
-            cv2.circle(img, (pos[0] - 1, pos[1] - 1), R - 2, ORANGE, -1, AA)
-            cv2.circle(img, (pos[0] - 3, pos[1] - 4), 3, (210, 235, 255), -1, AA)
-            if game._hittable():
+                r = v.size(R, d)
+                cv2.circle(img, (int(tx), int(ty)), max(1, int(r * f * 0.8)), scale_color(ORANGE, 0.25 + 0.5 * f), -1, AA)
+                g(tx, ty, r * 1.6 * f, scale_color(ORANGE, 0.5 * f))
+            (bx, by), d = v.pt(b.x, b.y, b.z)
+            r = max(3, int(v.size(R, d)))
+            g(bx, by, r * 3, (20, 90, 200))
+            cv2.circle(img, (bx, by), r, (20, 110, 230), -1, AA)
+            cv2.circle(img, (bx - r // 10, by - r // 10), max(1, r - 2), ORANGE, -1, AA)
+            cv2.circle(img, (bx - r // 3, by - r // 3), max(1, r // 3), (210, 235, 255), -1, AA)
+            if game.hittable():
                 pulse = 0.6 + 0.4 * math.sin(now * 18)
-                cv2.circle(img, pos, R + 7, scale_color(GOLD, pulse), 2, AA)
-                g(pos[0], pos[1], R + 12, scale_color(GOLD, 0.6))
+                cv2.circle(img, (bx, by), r + 6, scale_color(GOLD, pulse), 2, AA)
+                g(bx, by, r + 12, scale_color(GOLD, 0.6))
+
+        if b is not None and b.z > 0:
+            draw_ball()
+            draw_net(img, v)
+        else:
+            draw_net(img, v)
+            draw_ball()
 
         # Particles
         alive = []
         for p in self.particles:
-            p[4] -= dt
-            if p[4] <= 0:
+            p[6] -= dt
+            if p[6] <= 0:
                 continue
-            p[2] *= 0.985
-            p[3] += 900 * dt
-            p[0] += p[2] * dt
-            p[1] += p[3] * dt
-            f = p[4] / p[5]
-            cv2.circle(img, (int(p[0]), int(p[1])), max(1, int(p[7] * f)), scale_color(p[6], 0.4 + 0.6 * f), -1, AA)
-            g(p[0], p[1], p[7] * 3 * f, scale_color(p[6], f))
+            p[4] -= 9.8 * dt
+            p[0] += p[3] * dt
+            p[1] += p[4] * dt
+            p[2] += p[5] * dt
+            (sx, sy), d = v.pt(p[0], p[1], p[2])
+            f = p[6] / p[7]
+            r = v.size(p[9], d) * f
+            cv2.circle(img, (sx, sy), max(1, int(r)), scale_color(p[8], 0.4 + 0.6 * f), -1, AA)
+            g(sx, sy, r * 3, scale_color(p[8], f))
             alive.append(p)
         self.particles = alive
+
+        # Aim helpers in your paddle's plane: the hit-radius ring, and a marker
+        # showing where the incoming ball lines up with it.
+        coming = b is not None and game.last_hitter != 'PLAYER' and b.z < 0.5
+        if show_debug or coming:
+            ring = v.poly(circle_facing(px, py, C.PLAYER_Z, game.settings['hit_radius']))
+            col = GOLD if game.hittable() else (110, 90, 170)
+            for i in range(0, len(ring), 2):   # dashed
+                cv2.line(img, tuple(ring[i]), tuple(ring[(i + 1) % len(ring)]), col, 1, AA)
+        if coming:
+            (gx, gy), d = v.pt(b.x, b.y, C.PLAYER_Z)
+            cv2.drawMarker(img, (gx, gy), GOLD if game.hittable() else (180, 160, 200),
+                           cv2.MARKER_TILTED_CROSS, 14, 2, AA)
+
+        # Your paddle, see-through so the ball stays visible behind it
+        self._draw_paddle(img, glow, px, py, C.PLAYER_Z,
+                          12 + self._swing_lean(now - self.swing_t, self.swing_power), PLAYER_RUBBER, alpha=0.6)
 
         # Composite glow
         glow = cv2.GaussianBlur(glow, (0, 0), 2.2)
@@ -484,28 +569,33 @@ class Renderer:
             img = np.clip(img + self._red * self.flash, 0, 255).astype(np.uint8)
         self.flash *= math.exp(-dt * 4)
 
-        self._draw_hud(img, game, clicker, now, meter, side)
+        self._draw_hud(img, game, clicker, now, meter)
 
-        # Floating popups ("+1", "TOO HARD", ...)
+        # Floating popups ("+1", "TOO HARD", ...) anchored in the world
         for pu in self.popups:
-            age = now - pu[3]
+            age = now - pu[2]
             f = max(0.0, 1 - age / 1.0)
-            text(img, pu[0], (pu[1], pu[2] - age * 70), pu[5] * (1 + 0.3 * f), scale_color(pu[4], f), 2,
-                 font=FONT_BOLD)
-        self.popups = [pu for pu in self.popups if now - pu[3] < 1.0]
+            (sx, sy), _ = v.pt(*pu[1])
+            text(img, pu[0], (sx, sy - age * 70), pu[4] * (1 + 0.3 * f), scale_color(pu[3], f), 2, font=FONT_BOLD)
+        self.popups = [pu for pu in self.popups if now - pu[2] < 1.0]
 
-        # Camera preview, in the bottom corner on the CPU's side
+        # Camera preview, bottom-right
         if preview is not None:
             small = cv2.resize(preview, (C.PREVIEW_W, C.PREVIEW_H))
-            vx0 = W - C.PREVIEW_W - 12 if side == 'LEFT' else 12
-            vy0 = H - C.PREVIEW_H - 26
+            vx0, vy0 = W - C.PREVIEW_W - 12, H - C.PREVIEW_H - 26
             rounded_rect(img, (vx0 - 4, vy0 - 4, vx0 + C.PREVIEW_W + 4, vy0 + C.PREVIEW_H + 4), 8, (20, 20, 20))
             img[vy0:vy0 + C.PREVIEW_H, vx0:vx0 + C.PREVIEW_W] = small
             rounded_rect(img, (vx0 - 4, vy0 - 4, vx0 + C.PREVIEW_W + 4, vy0 + C.PREVIEW_H + 4), 8, (120, 120, 130), 2)
             text(img, 'CAMERA', (vx0 + 8, vy0 + 22), 0.5, WHITE, 1, anchor='left')
 
         if info:
-            text(img, info, (W // 2, H - 8), 0.45, (170, 170, 180), 1, shadow=True)
+            text(img, info, (W // 2, H - 8), 0.45, (170, 170, 180), 1)
+
+        if alert:   # tracking problem: red box under the top bar
+            (tw, _), _ = cv2.getTextSize(alert, FONT_BOLD, 0.75, 2)
+            y0 = C.TOP_BAR_H + 72
+            rounded_rect(img, (W // 2 - tw // 2 - 16, y0, W // 2 + tw // 2 + 16, y0 + 40), 10, (30, 30, 150))
+            text(img, alert, (W // 2, y0 + 29), 0.75, WHITE, 2, font=FONT_BOLD, shadow=False)
 
         if cursor is not None:
             cx, cy = int(cursor[0]), int(cursor[1])
@@ -516,7 +606,7 @@ class Renderer:
         return img
 
     # ----- HUD
-    def _draw_hud(self, img, game, clicker, now, meter, side):
+    def _draw_hud(self, img, game, clicker, now, meter):
         # Glassy top bar with a neon line under it
         bar = img[:C.TOP_BAR_H]
         cv2.addWeighted(bar, 0.35, np.full_like(bar, (28, 14, 18)), 0.65, 0, bar)
@@ -554,29 +644,28 @@ class Renderer:
         if game.phase == WAITING:
             frac = min(game.serve_in / C.SERVE_DELAY_SEC, 1.0)
             who = 'YOUR SERVE' if game.server == 'PLAYER' else 'CPU SERVES'
-            text(img, who, (W // 2, 300), 1.3, WHITE, 3, font=FONT_BOLD)
+            text(img, who, (W // 2, 215), 1.3, WHITE, 3, font=FONT_BOLD)
             bw = 260
-            rounded_rect(img, (W // 2 - bw // 2, 320, W // 2 + bw // 2, 330), 5, (60, 50, 60))
+            rounded_rect(img, (W // 2 - bw // 2, 235, W // 2 + bw // 2, 245), 5, (60, 50, 60))
             if frac > 0.03:
-                rounded_rect(img, (W // 2 - bw // 2, 320, W // 2 - bw // 2 + int(bw * frac), 330), 5, GOLD)
+                rounded_rect(img, (W // 2 - bw // 2, 235, W // 2 - bw // 2 + int(bw * frac), 245), 5, GOLD)
 
         # NEW HIGH SCORE banner
         age = now - self.banner_t
         if age < 1.8:
             pop = min(1.0, age / 0.15)
             f = 1.0 if age < 1.3 else max(0.0, 1 - (age - 1.3) / 0.5)
-            text(img, 'NEW HIGH SCORE!', (W // 2, 230), (1.0 + 0.6 * pop) * (1 + 0.05 * math.sin(now * 20)),
+            text(img, 'NEW HIGH SCORE!', (W // 2, 205), (1.0 + 0.6 * pop) * (1 + 0.05 * math.sin(now * 20)),
                  scale_color(GOLD, f), 4, font=FONT_BOLD)
 
-        self._draw_meter(img, game, meter, side)
+        self._draw_meter(img, game, meter)
 
-    def _draw_meter(self, img, game, level, side):
-        """Power meter on the player's edge: live swing power + threshold / min / max marks."""
+    def _draw_meter(self, img, game, level):
+        """Power meter on the left edge: live swing power + threshold / min / max marks."""
         s = game.settings
-        mh = self._meter_h
-        top, bot = C.TOP_BAR_H + 120, C.TOP_BAR_H + 120 + mh
-        x0 = 16 if side == 'LEFT' else W - 32
-        x1 = x0 + 16
+        mh, top = self._meter_h, self._meter_top
+        bot = top + mh
+        x0, x1 = 22, 38
         full = 2.5
 
         def y_of(p):
@@ -592,10 +681,8 @@ class Renderer:
             yy = y_of(p)
             cv2.line(img, (x0 - 6, yy), (x1 + 6, yy), color, 2, AA)
             if label:
-                lx = x1 + 10 if side == 'LEFT' else x0 - 10
-                text(img, label, (lx, yy + 5), 0.4, color, 1, anchor='left' if side == 'LEFT' else 'right')
+                text(img, label, (x1 + 10, yy + 5), 0.4, color, 1, anchor='left')
         cx = (x0 + x1) // 2
-        text(img, 'POWER', (cx + (18 if side == 'LEFT' else -18), top - 14), 0.45, (200, 180, 200), 1)
+        text(img, 'POWER', (cx + 10, top - 14), 0.45, (200, 180, 200), 1)
         if game.last_swing_power is not None:
-            text(img, f'{game.last_swing_power:.2f}', (cx + (18 if side == 'LEFT' else -18), bot + 24),
-                 0.55, WHITE, 1)
+            text(img, f'{game.last_swing_power:.2f}', (cx + 10, bot + 24), 0.55, WHITE, 1)

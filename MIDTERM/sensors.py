@@ -26,14 +26,36 @@ ARM_LANDMARKS = {
 }
 
 
-def open_camera(index=C.CAMERA_INDEX):
+def _try_camera(index):
     cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
-    if not cap.isOpened():
-        raise RuntimeError(
-            f'Could not open camera index {index}. Run list_cameras.py to find the '
-            'right CAMERA_INDEX, and check System Settings > Privacy & Security > '
-            'Camera allows this terminal / VS Code.')
-    return cap
+    if cap.isOpened():
+        # 720p is plenty for pose + tags and much faster than 1080p
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        ok, _ = cap.read()
+        if ok:
+            return cap
+    cap.release()
+    return None
+
+
+def open_camera(index=C.CAMERA_INDEX):
+    """Open `index`; if that fails, try the other indices before giving up."""
+    cap = _try_camera(index)
+    if cap is not None:
+        return cap
+    for other in range(4):
+        if other == index:
+            continue
+        cap = _try_camera(other)
+        if cap is not None:
+            print(f'WARNING: camera {index} did not work, using camera {other} instead. '
+                  f'Set CAMERA_INDEX = {other} in config.py to skip this.')
+            return cap
+    raise RuntimeError(
+        f'Could not open any camera (tried {index}, then 0-3). Check that no other app '
+        '(Zoom, Photo Booth, ...) is using it and that System Settings > Privacy & '
+        'Security > Camera allows this terminal / VS Code.')
 
 
 def map_to_rect(point, region, rect):

@@ -1,9 +1,10 @@
 """
 LEGO Motor Ping Pong.
 
-Hold the Double Motor like a paddle. The camera tracks the end of your arm
-(MediaPipe Pose) to place the paddle; swinging the motor (accelerometer)
-hits the ball, and harder swings hit deeper. Hold an AprilTag over a button
+3D view from behind you. Hold the Double Motor like a paddle. The camera
+tracks the end of your arm (MediaPipe Pose) to move the paddle left/right
+and up/down; swinging the motor (accelerometer) hits the ball, harder swings
+hit deeper, and hitting off-center aims left/right. Hold an AprilTag over a button
 at the top to click it.
 
     python main.py                        # full game (camera + motor)
@@ -22,7 +23,7 @@ import time
 import cv2
 
 import config as C
-from game import Game, mirror_x
+from game import Game, paddle_from_camera
 from mqttlib import MQTTClient
 from sensors import FakePaddle, Paddle, Vision, map_to_rect
 from ui import DwellClicker, Renderer, make_buttons
@@ -75,7 +76,7 @@ def main():
     args = ap.parse_args()
 
     scoreboard = Scoreboard()
-    game = Game(high_score=load_high_score(), on_new_high=scoreboard.new_high, side=args.hand.upper())
+    game = Game(high_score=load_high_score(), on_new_high=scoreboard.new_high, hand=args.hand.upper())
     scoreboard.publish(game.high_score)
 
     vision = None
@@ -110,6 +111,7 @@ def main():
     cv2.setMouseCallback(WINDOW, on_mouse)
 
     smoothed = None
+    last_seen = time.monotonic()      # last time the tracked hand was found
     show_debug = True
     reset_armed_until = 0.0
     last = time.monotonic()
@@ -123,15 +125,10 @@ def main():
             fps = 0.9 * fps + 0.1 * (1 / dt if dt > 0 else 0)
 
             # --- inputs ---
-            # The tracked hand follows the side the player is on (HAND button / 'l').
-            if vision and vision.hand != game.side.lower():
-                vision.hand = game.side.lower()
+            # The camera tracks whichever hand is picked (HAND button / 'l').
+            if vision and vision.hand != game.hand.lower():
+                vision.hand = game.hand.lower()
                 smoothed = None
-            # Paddle positions are mapped onto the zone as it appears on screen,
-            # then mirrored back into the game's player-on-the-left coordinates.
-            zx0, zy0, zx1, zy1 = C.PADDLE_ZONE
-            sx0, sx1 = sorted((mirror_x(zx0, game.side), mirror_x(zx1, game.side)))
-            screen_zone = (sx0, zy0, sx1, zy1)
 
             paddle_xy, cursor, preview, pose_found = None, None, None, False
             if vision:
@@ -139,18 +136,18 @@ def main():
                 if res is not None:
                     preview, pose_found = res.preview, res.pose_found
                     if res.arm_point is not None:
-                        tx, ty = map_to_rect(res.arm_point, C.CAMERA_PADDLE_REGION, screen_zone)
-                        target = (mirror_x(tx, game.side), ty)
+                        target = paddle_from_camera(res.arm_point)
                         a = C.PADDLE_SMOOTHING
                         smoothed = target if smoothed is None else (
                             smoothed[0] + a * (target[0] - smoothed[0]),
                             smoothed[1] + a * (target[1] - smoothed[1]))
                         paddle_xy = smoothed
+                        last_seen = now
                     if res.tag_point is not None:
                         cursor = map_to_rect(res.tag_point, C.CAMERA_TAG_REGION, (0, 0, C.WIDTH, C.HEIGHT))
             elif mouse['pos'] is not None:
-                paddle_xy = (mirror_x(mouse['pos'][0], game.side), mouse['pos'][1])
-
+                # The paddle goes right under the mouse pointer
+                paddle_xy = renderer.view.unproject(*mouse['pos'], C.PLAYER_Z)
             clicker.update(cursor, now)
             game.update(dt, paddle_xy, paddle.get_swing())
 
@@ -161,8 +158,17 @@ def main():
                       'mqtt: ok' if scoreboard.client else 'mqtt: off']
             if time.monotonic() < reset_armed_until:
                 status.append('press r again to reset high score')
+            # Big on-screen warning when tracking isn't working, so it's not only in the terminal
+            alert = ''
+            if not vision and not args.no_camera:
+                alert = 'NO CAMERA - using the mouse (see terminal)'
+            elif preview is not None and preview[::16, ::16].mean() < 1.0:
+                alert = 'CAMERA IS BLACK - quit Photo Booth / FaceTime / Zoom, or check camera permission'
+            elif vision and now - last_seen > 1.0:
+                alert = (f"CAN'T SEE YOUR {game.hand} HAND - keep it in view of the camera" if pose_found
+                         else "CAN'T SEE YOU - step back so your upper body is in view")
             img = renderer.draw(game, clicker, cursor, preview, meter=paddle.level,
-                                show_debug=show_debug, info='  |  '.join(status))
+                                show_debug=show_debug, info='  |  '.join(status), alert=alert)
             cv2.imshow(WINDOW, img)
 
             # --- keys ---
@@ -174,7 +180,7 @@ def main():
             elif key == ord('d'):
                 game.cycle_difficulty()
             elif key == ord('l'):
-                game.toggle_side()
+                game.toggle_hand()
             elif key == ord('h'):
                 show_debug = not show_debug
             elif key == ord('r'):

@@ -6,7 +6,7 @@ it land in the game's paddle zone?
     python pose_check.py --camera 0 --hand left
 
 Left: camera with skeleton (red dot = arm end used as the paddle).
-Right: the paddle zone from the game with where your paddle would be.
+Right: the game's paddle zone (seen from behind you) with where your paddle would be.
 Keys: h switch hand | a switch index/wrist point | q quit
 """
 
@@ -17,7 +17,8 @@ import cv2
 import numpy as np
 
 import config as C
-from sensors import Vision, map_to_rect
+from game import paddle_from_camera
+from sensors import Vision
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -51,20 +52,27 @@ def main():
             r0x, r0y, r1x, r1y = C.CAMERA_PADDLE_REGION
             cv2.rectangle(cam, (int(r0x * 640), int(r0y * 360)), (int(r1x * 640), int(r1y * 360)), (0, 255, 255), 1)
 
-            zone = np.full((360, int(360 * zone_w / zone_h), 3), 40, np.uint8)
+            zone = np.full((360, 480, 3), 40, np.uint8)
+            paddle = None
             if res.arm_point is not None:
-                gx, gy = map_to_rect(res.arm_point, C.CAMERA_PADDLE_REGION, C.PADDLE_ZONE)
-                zx = int((gx - zx0) / zone_w * zone.shape[1])
-                zy = int((gy - zy0) / zone_h * zone.shape[0])
+                paddle = paddle_from_camera(res.arm_point)     # meters, same as the game
+                zx = int((paddle[0] - zx0) / zone_w * zone.shape[1])
+                zy = int((zy1 - paddle[1]) / zone_h * zone.shape[0])   # world y is up
                 trail = (trail + [(zx, zy)])[-30:]
             for (ax, ay), (bx, by) in zip(trail, trail[1:]):
                 cv2.line(zone, (ax, ay), (bx, by), (60, 60, 160), 2)
             if trail and res.arm_point is not None:
                 cv2.ellipse(zone, trail[-1], (8, 20), 0, 0, 360, (60, 60, 230), -1)
-            # Table height inside the zone, for reference
-            ty = int((C.TABLE_Y - zy0) / zone_h * zone.shape[0])
-            cv2.line(zone, (0, ty), (zone.shape[1], ty), (90, 130, 40), 3)
+            # Table height and edges inside the zone, for reference
+            ty = int((zy1 - C.TABLE_H) / zone_h * zone.shape[0])
+            tx0 = int((-C.TABLE_HALF_W - zx0) / zone_w * zone.shape[1])
+            tx1 = int((C.TABLE_HALF_W - zx0) / zone_w * zone.shape[1])
+            cv2.line(zone, (tx0, ty), (tx1, ty), (165, 85, 25), 4)
+            cv2.putText(zone, 'table', (tx0 + 5, ty + 20), FONT, 0.45, (165, 85, 25), 1)
             cv2.putText(zone, 'paddle zone', (5, 20), FONT, 0.5, (200, 200, 200), 1)
+            if paddle is not None:
+                cv2.putText(zone, f'x {paddle[0]:+.2f} m  y {paddle[1]:.2f} m', (5, 345), FONT, 0.5,
+                            (200, 200, 200), 1)
 
             img = cv2.copyMakeBorder(np.hstack([cam, zone]), 0, 80, 0, 0,
                                      cv2.BORDER_CONSTANT, value=(25, 25, 25))

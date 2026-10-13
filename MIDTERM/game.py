@@ -1,17 +1,17 @@
 """
-Ping pong game logic: ball physics, CPU, serving, scoring, difficulty.
+Ping pong game logic in 3D: ball physics, CPU, serving, scoring, difficulty.
 
 No OpenCV, camera, or motor in here -- main.py feeds in the paddle position
 and swing events each frame, so this file can be unit-tested with made-up
 inputs (tests/test_game.py).
 
-Side view, pixels, y grows downward. In game coordinates the player is
-ALWAYS on the left and the CPU on the right; when the player picks the right
-side (left/right handed), only the drawing and the paddle input are mirrored
-with mirror_x(). That keeps the physics and tests the same for both sides.
+World coordinates are meters (see config.py):
+    x = left/right, y = up, z = along the table (player at -z, CPU at +z)
+The player's paddle moves in the plane z = PLAYER_Z, so it has an (x, y)
+position -- exactly how your hand moves in front of the webcam.
 
 The game also queues `events` (hits, bounces, lost balls, ...) for the
-renderer to turn into sparks, sounds, shakes, etc.
+renderer to turn into sparks, shakes, etc.
 """
 
 import math
@@ -24,51 +24,58 @@ WAITING = 'waiting'   # pause before a serve
 PLAYING = 'playing'
 
 
-def mirror_x(x, side):
-    """Game x <-> screen x. Same function both ways."""
-    return x if side == 'LEFT' else C.WIDTH - x
-
-
 class Ball:
-    def __init__(self, x, y, vx=0.0, vy=0.0):
-        self.x, self.y, self.vx, self.vy = x, y, vx, vy
+    def __init__(self, x, y, z, vx=0.0, vy=0.0, vz=0.0):
+        self.x, self.y, self.z = x, y, z
+        self.vx, self.vy, self.vz = vx, vy, vz
 
 
-def solve_shot(x0, y0, x1, y1, flight_time, clear_net=True):
+def paddle_from_camera(point, region=C.CAMERA_PADDLE_REGION):
+    """Normalized (mirrored) camera point -> paddle (x, y) in meters."""
+    nx, ny = point
+    r0x, r0y, r1x, r1y = region
+    fx = min(max((nx - r0x) / (r1x - r0x), 0.0), 1.0)
+    fy = min(max((ny - r0y) / (r1y - r0y), 0.0), 1.0)
+    x0, y0, x1, y1 = C.PADDLE_ZONE
+    return (x0 + fx * (x1 - x0), y1 - fy * (y1 - y0))   # image y grows down, world y up
+
+
+def solve_shot(p0, target, flight_time, clear_net=True):
     """
-    Velocity that takes the ball from (x0, y0) to (x1, y1) in `flight_time`
-    seconds under gravity. If that path would clip the net, lob it higher
-    (longer flight time) until it clears.
+    Velocity (vx, vy, vz) that takes the ball from p0 to target (x, y, z) in
+    `flight_time` seconds under gravity. If that path would clip the net,
+    lob it higher (longer flight time) until it clears.
     """
+    x0, y0, z0 = p0
+    x1, y1, z1 = target
     t = flight_time
+    top = C.TABLE_H + C.NET_H + C.BALL_RADIUS + C.NET_CLEARANCE
     for _ in range(20 if clear_net else 1):
-        vx = (x1 - x0) / t
-        vy = (y1 - y0 - 0.5 * C.GRAVITY * t * t) / t
-        if vx == 0 or (C.NET_X - x0) / vx < 0:   # path never crosses the net
-            return vx, vy
-        tn = (C.NET_X - x0) / vx                  # time when x == net
-        if tn > t:                                # lands before reaching the net
-            return vx, vy
-        y_net = y0 + vy * tn + 0.5 * C.GRAVITY * tn * tn
-        if y_net <= C.TABLE_Y - C.NET_H - C.NET_CLEARANCE:
-            return vx, vy
+        vx, vz = (x1 - x0) / t, (z1 - z0) / t
+        vy = (y1 - y0 + 0.5 * C.GRAVITY * t * t) / t
+        if vz == 0 or z0 * z1 > 0:                # doesn't cross the net
+            break
+        tn = -z0 / vz                             # time when z == 0
+        if y0 + vy * tn - 0.5 * C.GRAVITY * tn * tn >= top:
+            break
         t *= 1.1
-    return vx, vy
+    return vx, vy, vz
 
 
 class Game:
     def __init__(self, difficulty=C.START_DIFFICULTY, server=C.START_SERVER,
-                 high_score=0, on_new_high=None, rng=None, side=C.START_SIDE):
+                 high_score=0, on_new_high=None, rng=None, hand=C.HAND.upper()):
         self.difficulty = difficulty
-        self.side = side                   # 'LEFT' or 'RIGHT': where the player is on screen
         self.server = server               # 'PLAYER' or 'CPU'
+        self.hand = hand                   # 'RIGHT' or 'LEFT': which hand the camera tracks
         self.score = 0
         self.high_score = high_score
         self.on_new_high = on_new_high     # called with the new high score
         self.rng = rng or random.Random()
 
         self.time = 0.0
-        self.paddle = (C.PADDLE_ZONE[0] + 100, C.TABLE_Y - 60)
+        self.paddle = (0.0, C.TABLE_H + 0.25)   # (x, y) in the PLAYER_Z plane
+        self.cpu_x = 0.0                         # CPU paddle slides left/right
         self.ball = None
         self.phase = WAITING
         self._phase_until = C.SERVE_DELAY_SEC
@@ -95,8 +102,8 @@ class Game:
         self.difficulty = order[(order.index(self.difficulty) + 1) % len(order)]
         self._restart_point()
 
-    def toggle_side(self):
-        self.side = 'RIGHT' if self.side == 'LEFT' else 'LEFT'
+    def toggle_hand(self):
+        self.hand = 'LEFT' if self.hand == 'RIGHT' else 'RIGHT'
         self._restart_point()
 
     @property
@@ -113,17 +120,26 @@ class Game:
         if self.on_new_high:
             self.on_new_high(0)
 
+    def hittable(self):
+        b = self.ball
+        return (b is not None and self.last_hitter != 'PLAYER'
+                and C.PLAYER_REACH_Z <= b.z <= C.PLAYER_HIT_Z)
+
     # ---------- per-frame update ----------
     def update(self, dt, paddle_xy=None, swing_power=None):
         """
         dt:          seconds since the last frame
-        paddle_xy:   paddle position in screen pixels, or None if not seen
+        paddle_xy:   paddle (x, y) in meters, or None if not seen
         swing_power: power of a swing that just finished, or None
         """
         self.time += dt
         if paddle_xy is not None:
             x0, y0, x1, y1 = C.PADDLE_ZONE
             self.paddle = (min(max(paddle_xy[0], x0), x1), min(max(paddle_xy[1], y0), y1))
+
+        # CPU paddle drifts toward the ball's x when the ball is coming its way
+        target = self.ball.x if self.ball is not None and self.last_hitter == 'PLAYER' else 0.0
+        self.cpu_x += (target - self.cpu_x) * min(1.0, dt * 6)
 
         if self.phase == WAITING:
             if self.time >= self._phase_until:
@@ -163,37 +179,35 @@ class Game:
         self.phase = PLAYING
         self.bounces = {'PLAYER': 0, 'CPU': 0}
         if self.server == 'PLAYER':
-            # Toss the ball straight up in front of the player.
-            self.ball = Ball(C.TABLE_LEFT - 70, C.TABLE_Y - 40, 0.0, -650.0)
+            # Toss the ball up just in front of the player, in line with the paddle.
+            x = min(max(self.paddle[0], -0.6), 0.6)
+            self.ball = Ball(x, C.TABLE_H + 0.2, C.PLAYER_Z + 0.25, 0.0, 2.6, 0.0)
             self.last_hitter = None
             self._say('YOUR SERVE - swing!')
             self._emit('serve', by='PLAYER')
         else:
-            self.ball = Ball(C.CPU_HIT_X, C.TABLE_Y - 100)
+            self.ball = Ball(self.rng.uniform(-0.4, 0.4), C.TABLE_H + 0.3, C.CPU_HIT_Z)
+            self.cpu_x = self.ball.x
             self._cpu_hit()
             self._say('CPU SERVES')
             self._emit('serve', by='CPU')
 
     def _point_over(self, reason):
         b = self.ball
-        self._emit('lost', x=b.x, y=b.y, reason=reason, score=self.score)
+        self._emit('lost', x=b.x, y=b.y, z=b.z, reason=reason, score=self.score)
         self._say(reason, 'bad')
         self._restart_point()
-
-    def _hittable(self):
-        b = self.ball
-        return b is not None and self.last_hitter != 'PLAYER' and b.x <= C.PLAYER_HIT_X
 
     def _player_swing(self, power):
         self.last_swing_power = power
         self._emit('swing', power=power)
-        if not self._hittable():
+        if not self.hittable():
             self._say('swing - ball not in reach')
             return
         b = self.ball
         dist = math.hypot(b.x - self.paddle[0], b.y - self.paddle[1])
         if dist > self.settings['hit_radius']:
-            self._say(f'MISS - {int(dist)}px away', 'bad')
+            self._say(f'MISS - {100 * dist:.0f} cm away', 'bad')
             self._emit('whiff', dist=dist)
             return
         self._player_hit(power)
@@ -204,30 +218,34 @@ class Game:
         self.last_hitter = 'PLAYER'
         self.bounces = {'PLAYER': 0, 'CPU': 0}
 
+        # Hitting the ball off-center steers it: paddle left of the ball -> goes right.
+        off = (b.x - self.paddle[0]) / s['hit_radius']
+        aim_x = min(max(off * C.AIM_STRENGTH, -C.TABLE_HALF_W + 0.1), C.TABLE_HALF_W - 0.1)
+
         if power < s['min_power']:
-            # Too soft: aim straight into the net.
-            b.vx, b.vy = solve_shot(b.x, b.y, C.NET_X + 2, C.TABLE_Y - C.NET_H / 2,
-                                    s['player_flight_slow'], clear_net=False)
+            # Too soft: straight into the net.
+            b.vx, b.vy, b.vz = solve_shot((b.x, b.y, b.z), (aim_x, C.TABLE_H + C.NET_H / 2, 0.02),
+                                          s['player_flight_slow'], clear_net=False)
             self._say(f'too soft ({power:.2f})', 'bad')
             quality = 'soft'
-        elif power > s['max_power']:
-            # Too hard: sails past the end of the table.
-            target_x, flight = C.TABLE_RIGHT + 250, s['player_flight_fast']
-            self._say(f'too hard ({power:.2f})', 'bad')
-            quality = 'hard'
         else:
-            # In range: harder = deeper and faster.
-            f = (power - s['min_power']) / (s['max_power'] - s['min_power'])
-            target_x = C.NET_X + 40 + f * (C.TABLE_RIGHT - C.NET_X - 70)
-            flight = s['player_flight_slow'] + f * (s['player_flight_fast'] - s['player_flight_slow'])
-            self._say(f'HIT! power {power:.2f}', 'good')
-            quality = 'good'
-        if power >= s['min_power']:
-            b.vx, b.vy = solve_shot(b.x, b.y, target_x, C.TABLE_Y, flight)
+            if power > s['max_power']:
+                # Too hard: sails past the end of the table.
+                target_z, flight = C.TABLE_HALF_L + 0.9, s['player_flight_fast']
+                self._say(f'too hard ({power:.2f})', 'bad')
+                quality = 'hard'
+            else:
+                # In range: harder = deeper and faster.
+                f = (power - s['min_power']) / (s['max_power'] - s['min_power'])
+                target_z = 0.35 + f * (C.TABLE_HALF_L - 0.5)
+                flight = s['player_flight_slow'] + f * (s['player_flight_fast'] - s['player_flight_slow'])
+                self._say(f'HIT! power {power:.2f}', 'good')
+                quality = 'good'
+            b.vx, b.vy, b.vz = solve_shot((b.x, b.y, b.z), (aim_x, C.TABLE_H + C.BALL_RADIUS, target_z), flight)
 
         # Score counts every hit you make; it's cleared when the ball is lost.
         self.score += 1
-        self._emit('hit', x=b.x, y=b.y, power=power, quality=quality, score=self.score)
+        self._emit('hit', x=b.x, y=b.y, z=b.z, power=power, quality=quality, score=self.score)
         if self.score > self.high_score:
             self.high_score = self.score
             self._emit('new_high', score=self.score)
@@ -238,30 +256,35 @@ class Game:
         b = self.ball
         self.last_hitter = 'CPU'
         self.bounces = {'PLAYER': 0, 'CPU': 0}
-        self._emit('cpu_hit', x=b.x, y=b.y)
-        target_x = self.rng.uniform(C.TABLE_LEFT + 60, C.NET_X - 80)
-        b.vx, b.vy = solve_shot(b.x, b.y, target_x, C.TABLE_Y, self.settings['cpu_flight'])
+        self._emit('cpu_hit', x=b.x, y=b.y, z=b.z)
+        target = (self.rng.uniform(-0.55, 0.55), C.TABLE_H + C.BALL_RADIUS,
+                  self.rng.uniform(-C.TABLE_HALF_L + 0.2, -0.4))
+        b.vx, b.vy, b.vz = solve_shot((b.x, b.y, b.z), target, self.settings['cpu_flight'])
 
     def _step(self, h):
         b = self.ball
-        px, py = b.x, b.y
-        b.vy += C.GRAVITY * h
+        pz, py = b.z, b.y
+        b.vy -= C.GRAVITY * h
         b.x += b.vx * h
         b.y += b.vy * h
+        b.z += b.vz * h
+        R = C.BALL_RADIUS
+        over_table = abs(b.x) <= C.TABLE_HALF_W and abs(b.z) <= C.TABLE_HALF_L
 
-        # Net: crossed the net's x while below the top of the net
-        if ((px - C.NET_X) * (b.x - C.NET_X) <= 0 and px != b.x
-                and C.TABLE_Y - C.NET_H < b.y <= C.TABLE_Y):
+        # Net: crossed z = 0 below the top of the net
+        if (pz * b.z <= 0 and pz != b.z and abs(b.x) <= C.TABLE_HALF_W + C.NET_OVERHANG
+                and C.TABLE_H - R < b.y - R < C.TABLE_H + C.NET_H):
             self._point_over('NET')
             return
 
         # Table bounce
-        if py < C.TABLE_Y <= b.y and b.vy > 0 and C.TABLE_LEFT <= b.x <= C.TABLE_RIGHT:
-            b.y = C.TABLE_Y
+        surface = C.TABLE_H + R
+        if py > surface >= b.y and b.vy < 0 and over_table:
+            b.y = surface
             b.vy = -b.vy * C.RESTITUTION
-            side = 'PLAYER' if b.x < C.NET_X else 'CPU'
+            side = 'PLAYER' if b.z < 0 else 'CPU'
             self.bounces[side] += 1
-            self._emit('bounce', x=b.x, y=b.y)
+            self._emit('bounce', x=b.x, y=C.TABLE_H, z=b.z)
             if self.last_hitter == 'PLAYER' and side == 'PLAYER':
                 self._point_over('bounced on your side')
                 return
@@ -270,12 +293,13 @@ class Game:
                 return
 
         # CPU returns any ball that bounced once on its side
-        if self.last_hitter == 'PLAYER' and self.bounces['CPU'] == 1 and b.x >= C.CPU_HIT_X:
+        if self.last_hitter == 'PLAYER' and self.bounces['CPU'] == 1 and b.z >= C.CPU_HIT_Z:
+            self.cpu_x = b.x
             self._cpu_hit()
             return
 
-        # Off the table / off screen
-        if b.y > C.FLOOR_Y or b.x < -50 or b.x > C.WIDTH + 50:
+        # Floor, behind you, or way off the table
+        if b.y < R or b.z < C.PLAYER_REACH_Z - 0.5 or b.z > C.CPU_Z + 1.5 or abs(b.x) > 3:
             if self.last_hitter == 'PLAYER':
                 self._point_over('OUT - off the table')
             else:
