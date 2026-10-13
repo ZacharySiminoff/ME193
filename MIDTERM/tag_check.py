@@ -20,7 +20,7 @@ import numpy as np
 import config as C
 from game import Game
 from sensors import Vision, map_to_rect
-from ui import DwellClicker, make_buttons, draw_game
+from ui import DwellClicker, Renderer, make_buttons
 
 
 def make_tag(tag_id):
@@ -44,6 +44,7 @@ def main():
 
     game = Game()                     # only used for button labels / actions
     clicker = DwellClicker(make_buttons(game))
+    renderer = Renderer()
     vision = Vision(args.camera, use_pose=False)
     seen = 0
     frames = 0
@@ -63,10 +64,10 @@ def main():
             if clicked:
                 print(f'CLICK -> {clicked.label_fn()}')
 
-            img = draw_game(game, clicker, cursor, res.preview, show_debug=False,
-                            info=f'tag: {res.tag_id if res.tag_id is not None else "none"}   '
-                                 f'seen {100 * seen / frames:.0f}% of frames   '
-                                 f'cursor: {tuple(int(v) for v in cursor) if cursor else "-"}   q quit')
+            img = renderer.draw(game, clicker, cursor, res.preview, show_debug=False,
+                                info=f'tag: {res.tag_id if res.tag_id is not None else "none"}   '
+                                     f'seen {100 * seen / frames:.0f}% of frames   '
+                                     f'cursor: {tuple(int(v) for v in cursor) if cursor else "-"}   q quit')
             # Bigger camera view than the game uses, so the tag is easy to see
             cam = cv2.resize(res.preview, (480, 270))
             img[C.TOP_BAR_H + 10:C.TOP_BAR_H + 280, C.WIDTH - 490:C.WIDTH - 10] = cam

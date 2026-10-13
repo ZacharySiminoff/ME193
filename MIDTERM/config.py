@@ -34,7 +34,10 @@ FAKE_SWING_KEYS = {ord('1'): 0.25, ord('2'): 1.0, ord('3'): 2.5}
 
 # --- Camera / pose ---
 CAMERA_INDEX = 1           # run list_cameras.py to find yours
-HAND = 'right'             # which hand holds the motor: 'right' or 'left'
+# Which hand holds the motor: 'right' or 'left'. The player's paddle goes on
+# the same side of the screen (the camera view is mirrored, so your right hand
+# is on the right). Switch in game with the HAND button or the 'l' key.
+HAND = 'right'
 ARM_POINT = 'index'        # 'index' (end of the hand) or 'wrist'
 MIN_VISIBILITY = 0.5       # landmarks less visible than this are ignored
 POSE_MODEL_COMPLEXITY = 1  # 1 ships with mediapipe; 0 (faster) and 2 download a model on first use
@@ -52,7 +55,7 @@ CLICK_COOLDOWN_SEC = 1.5
 # --- Window / layout (pixels) ---
 WIDTH, HEIGHT = 1280, 720
 TOP_BAR_H = 90
-PREVIEW_W, PREVIEW_H = 320, 180
+PREVIEW_W, PREVIEW_H = 256, 144   # bottom corner on the CPU side, below the table
 TABLE_LEFT, TABLE_RIGHT = 240, 1040
 TABLE_Y = 520              # top surface of the table
 NET_X = (TABLE_LEFT + TABLE_RIGHT) // 2
@@ -87,6 +90,7 @@ DIFFICULTIES = {
 DIFFICULTY_ORDER = ['EASY', 'MEDIUM', 'HARD']
 START_DIFFICULTY = 'MEDIUM'
 START_SERVER = 'PLAYER'    # 'PLAYER' or 'CPU'
+START_SIDE = HAND.upper()  # 'LEFT' or 'RIGHT'
 
 # --- MQTT / high score ---
 MQTT_BROKER = 'test.mosquitto.org'

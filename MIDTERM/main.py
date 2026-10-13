@@ -11,7 +11,7 @@ at the top to click it.
     python main.py --no-camera            # mouse moves the paddle
     python main.py --no-motor --no-camera # no hardware at all
 
-Keys: q quit | s serve | d difficulty | h hide/show debug | r r reset high score
+Keys: q quit | s serve | d difficulty | l left/right hand | h hide/show debug | r r reset high score
 """
 
 import argparse
@@ -22,10 +22,10 @@ import time
 import cv2
 
 import config as C
-from game import Game
+from game import Game, mirror_x
 from mqttlib import MQTTClient
 from sensors import FakePaddle, Paddle, Vision, map_to_rect
-from ui import DwellClicker, draw_game, make_buttons
+from ui import DwellClicker, Renderer, make_buttons
 
 WINDOW = 'LEGO Ping Pong'
 
@@ -75,7 +75,7 @@ def main():
     args = ap.parse_args()
 
     scoreboard = Scoreboard()
-    game = Game(high_score=load_high_score(), on_new_high=scoreboard.new_high)
+    game = Game(high_score=load_high_score(), on_new_high=scoreboard.new_high, side=args.hand.upper())
     scoreboard.publish(game.high_score)
 
     vision = None
@@ -96,6 +96,7 @@ def main():
 
     buttons = make_buttons(game)
     clicker = DwellClicker(buttons)
+    renderer = Renderer()
     mouse = {'pos': None}
 
     def on_mouse(event, x, y, flags, param):
@@ -122,13 +123,24 @@ def main():
             fps = 0.9 * fps + 0.1 * (1 / dt if dt > 0 else 0)
 
             # --- inputs ---
+            # The tracked hand follows the side the player is on (HAND button / 'l').
+            if vision and vision.hand != game.side.lower():
+                vision.hand = game.side.lower()
+                smoothed = None
+            # Paddle positions are mapped onto the zone as it appears on screen,
+            # then mirrored back into the game's player-on-the-left coordinates.
+            zx0, zy0, zx1, zy1 = C.PADDLE_ZONE
+            sx0, sx1 = sorted((mirror_x(zx0, game.side), mirror_x(zx1, game.side)))
+            screen_zone = (sx0, zy0, sx1, zy1)
+
             paddle_xy, cursor, preview, pose_found = None, None, None, False
             if vision:
                 res = vision.read()
                 if res is not None:
                     preview, pose_found = res.preview, res.pose_found
                     if res.arm_point is not None:
-                        target = map_to_rect(res.arm_point, C.CAMERA_PADDLE_REGION, C.PADDLE_ZONE)
+                        tx, ty = map_to_rect(res.arm_point, C.CAMERA_PADDLE_REGION, screen_zone)
+                        target = (mirror_x(tx, game.side), ty)
                         a = C.PADDLE_SMOOTHING
                         smoothed = target if smoothed is None else (
                             smoothed[0] + a * (target[0] - smoothed[0]),
@@ -136,8 +148,8 @@ def main():
                         paddle_xy = smoothed
                     if res.tag_point is not None:
                         cursor = map_to_rect(res.tag_point, C.CAMERA_TAG_REGION, (0, 0, C.WIDTH, C.HEIGHT))
-            else:
-                paddle_xy = mouse['pos']
+            elif mouse['pos'] is not None:
+                paddle_xy = (mirror_x(mouse['pos'][0], game.side), mouse['pos'][1])
 
             clicker.update(cursor, now)
             game.update(dt, paddle_xy, paddle.get_swing())
@@ -149,8 +161,8 @@ def main():
                       'mqtt: ok' if scoreboard.client else 'mqtt: off']
             if time.monotonic() < reset_armed_until:
                 status.append('press r again to reset high score')
-            img = draw_game(game, clicker, cursor, preview, meter=paddle.level,
-                            show_debug=show_debug, info='  |  '.join(status))
+            img = renderer.draw(game, clicker, cursor, preview, meter=paddle.level,
+                                show_debug=show_debug, info='  |  '.join(status))
             cv2.imshow(WINDOW, img)
 
             # --- keys ---
@@ -161,6 +173,8 @@ def main():
                 game.toggle_server()
             elif key == ord('d'):
                 game.cycle_difficulty()
+            elif key == ord('l'):
+                game.toggle_side()
             elif key == ord('h'):
                 show_debug = not show_debug
             elif key == ord('r'):

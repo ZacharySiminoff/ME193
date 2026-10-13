@@ -183,3 +183,31 @@ def test_reset_high_score():
     g = make_game(high_score=7, on_new_high=highs.append)
     g.reset_high_score()
     assert g.high_score == 0 and highs == [0]
+
+
+def test_mirror_x_round_trips():
+    from game import mirror_x
+    assert mirror_x(100, 'LEFT') == 100
+    assert mirror_x(100, 'RIGHT') == C.WIDTH - 100
+    assert mirror_x(mirror_x(321, 'RIGHT'), 'RIGHT') == 321
+
+
+def test_toggle_side_restarts_rally():
+    g = make_game(server='PLAYER', side='LEFT')
+    wait_for_serve(g)
+    swing_at_ball(g)
+    assert g.score == 1
+    g.toggle_side()
+    assert g.side == 'RIGHT' and g.score == 0 and g.phase == WAITING and g.high_score == 1
+
+
+def test_events_for_renderer():
+    g = make_game(server='PLAYER')
+    wait_for_serve(g)
+    swing_at_ball(g)
+    kinds = [k for k, _ in g.pop_events()]
+    assert kinds[:4] == ['serve', 'swing', 'hit', 'new_high']
+    assert g.pop_events() == []          # popping clears the queue
+    assert run_until(g, lambda g: g.last_hitter == 'CPU')
+    kinds = [k for k, _ in g.pop_events()]
+    assert 'bounce' in kinds and 'cpu_hit' in kinds
