@@ -8,12 +8,18 @@ import logging
 import math
 import threading
 import time
+import warnings
 
 import cv2
 import mediapipe as mp
 
 import config as C
 from swing import SwingDetector
+
+# The legoeducation library's own cleanup (at exit, or after a failed/interrupted
+# Bluetooth scan) leaves this harmless warning; it's not a problem in our code.
+warnings.filterwarnings('ignore', message=".*TransportManager.close' was never awaited",
+                        category=RuntimeWarning)
 
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
@@ -26,35 +32,46 @@ ARM_LANDMARKS = {
 }
 
 
-def _try_camera(index):
+def _try_camera(index, warmup_sec=1.5):
+    """
+    Open camera `index` and return it only if it delivers a real (non-black)
+    image. macOS "opens" cameras that only send black frames -- e.g. an iPhone
+    Continuity Camera that isn't set up, or a camera another app is holding.
+    """
     cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
-    if cap.isOpened():
-        # 720p is plenty for pose + tags and much faster than 1080p
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        ok, _ = cap.read()
-        if ok:
+    if not cap.isOpened():
+        cap.release()
+        return None
+    # 720p is plenty for pose + tags and much faster than 1080p
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < warmup_sec:   # cameras start dark for a moment
+        ok, frame = cap.read()
+        if ok and frame[::16, ::16].mean() > 2.0:
             return cap
     cap.release()
     return None
 
 
 def open_camera(index=C.CAMERA_INDEX):
-    """Open `index`; if that fails, try the other indices before giving up."""
-    cap = _try_camera(index)
-    if cap is not None:
-        return cap
-    for other in range(4):
-        if other == index:
-            continue
-        cap = _try_camera(other)
+    """
+    Open the camera that actually shows a picture: `index` first, then the
+    others. Camera numbers change when an iPhone (Continuity Camera) comes and
+    goes, so a fixed number alone isn't reliable.
+    """
+    order = [index] + [i for i in range(4) if i != index]
+    for i in order:
+        cap = _try_camera(i)
         if cap is not None:
-            print(f'WARNING: camera {index} did not work, using camera {other} instead. '
-                  f'Set CAMERA_INDEX = {other} in config.py to skip this.')
+            if i != index:
+                print(f'NOTE: camera {index} gave no picture, using camera {i} instead.')
+            else:
+                print(f'Using camera {i}.')
             return cap
     raise RuntimeError(
-        f'Could not open any camera (tried {index}, then 0-3). Check that no other app '
-        '(Zoom, Photo Booth, ...) is using it and that System Settings > Privacy & '
+        'No camera gave a picture (tried 0-3; they were missing or all black). Quit '
+        'Photo Booth / FaceTime / Zoom if open, and check System Settings > Privacy & '
         'Security > Camera allows this terminal / VS Code.')
 
 
