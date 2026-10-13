@@ -1,0 +1,8 @@
+# Pinned: 0.10.14 still has the legacy mp.solutions.pose API (no model file
+# to download) and is the version already working in ME193/leave_the_room.
+mediapipe==0.10.14
+opencv-contrib-python   # includes cv2.aruco with the AprilTag 36h11 dictionary
+legoeducation           # LEGO Double Motor over Bluetooth
+paho-mqtt>=2.0          # mqttlib.py
+numpy
+pytest                  # tests/
